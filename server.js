@@ -1,181 +1,30 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const crypto = require("crypto");
-
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-app.use(express.static("public"));
-
-const rooms = new Map();
-const MIN_PLAYERS = 3;
-const MAX_PLAYERS = 16;
-const DEFAULTS = { night: 35, day: 75, vote: 30 };
-
-function makeCode() {
-  let code;
-  do { code = crypto.randomBytes(3).toString("hex").toUpperCase(); } while (rooms.has(code));
-  return code;
-}
-
-function assignRoles(players) {
-  const list = [...players];
-  const mafiaCount = list.length >= 8 ? 2 : 1;
-  const roles = Array(mafiaCount).fill("mafia");
-  if (list.length >= 4) roles.push("oldman");
-  if (list.length >= 5) roles.push("doctor");
-  while (roles.length < list.length) roles.push("citizen");
-  for (let i = roles.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [roles[i], roles[j]] = [roles[j], roles[i]];
-  }
-  list.forEach((p, i) => { p.role = roles[i]; p.alive = true; p.usedOldman = false; });
-}
-
-function alivePlayers(room) { return [...room.players.values()].filter(p => p.alive); }
-function checkWin(room) {
-  const alive = alivePlayers(room);
-  const mafia = alive.filter(p => p.role === "mafia").length;
-  if (mafia === 0) return "citizens";
-  if (mafia >= alive.length - mafia) return "mafia";
-  return null;
-}
-function publicRoom(room) {
-  return {
-    code: room.code, hostId: room.hostId, started: room.started, phase: room.phase,
-    maxPlayers: room.maxPlayers, timerEndsAt: room.timerEndsAt,
-    players: [...room.players.values()].map(p => ({ id:p.id, name:p.name, alive:p.alive }))
-  };
-}
-function emitRoom(room) { io.to(room.code).emit("room:update", publicRoom(room)); }
-function privatePlayers(room, viewer) {
-  return [...room.players.values()].map(p => ({ id:p.id, name:p.name, alive:p.alive, self:p.id===viewer.id }));
-}
-function clearTimer(room) { if (room.timer) clearTimeout(room.timer); room.timer = null; }
-function startTimer(room, phase, seconds, done) {
-  clearTimer(room);
-  room.phase = phase;
-  room.timerEndsAt = Date.now() + seconds * 1000;
-  io.to(room.code).emit("game:phase", { phase, endsAt: room.timerEndsAt });
-  emitRoom(room);
-  room.timer = setTimeout(() => { room.timer = null; done(); }, seconds * 1000);
-}
-function finishGame(room, winner) {
-  clearTimer(room); room.phase = "ended"; room.timerEndsAt = null;
-  io.to(room.code).emit("game:ended", { winner, players:[...room.players.values()].map(p=>({name:p.name,role:p.role,alive:p.alive})) });
-  emitRoom(room);
-}
-function resolveNight(room) {
-  if (!room.started || room.phase !== "night") return;
-  clearTimer(room);
-  const victim = room.night.mafiaTarget ? room.players.get(room.night.mafiaTarget) : null;
-  const saved = room.night.doctorTarget ? room.players.get(room.night.doctorTarget) : null;
-  if (victim && victim.alive && victim.id !== saved?.id) {
-    victim.alive = false;
-    io.to(room.code).emit("game:notice", `☠️ ${victim.name} لم ينجُ من الليل.`);
-  } else if (victim) {
-    io.to(room.code).emit("game:notice", "🩺 الطبيب أنقذ الضحية! لا أحد مات الليلة.");
-  } else {
-    io.to(room.code).emit("game:notice", "🌙 مرّ الليل دون ضحية.");
-  }
-  for (const p of room.players.values()) {
-    if (p.role === "oldman" && room.night.oldmanTarget) {
-      const target = room.players.get(room.night.oldmanTarget);
-      if (target) io.to(p.id).emit("oldman:result", { targetId:target.id, targetName:target.name, isMafia:target.role === "mafia" });
-    }
-  }
-  room.night = { mafiaTarget:null, doctorTarget:null, oldmanTarget:null };
-  const win = checkWin(room);
-  if (win) return finishGame(room, win);
-  startTimer(room, "day", room.settings.day, () => startVote(room));
-}
-function startVote(room) {
-  if (!room.started) return;
-  room.votes.clear();
-  startTimer(room, "vote", room.settings.vote, () => resolveVote(room));
-}
-function resolveVote(room) {
-  if (!room.started || room.phase !== "vote") return;
-  clearTimer(room);
-  const counts = {};
-  for (const id of room.votes.values()) counts[id] = (counts[id] || 0) + 1;
-  const max = Math.max(0, ...Object.values(counts));
-  const winners = Object.entries(counts).filter(([,n]) => n === max).map(([id]) => id);
-  if (winners.length === 1 && max > 0) {
-    const eliminated = room.players.get(winners[0]);
-    if (eliminated?.alive) { eliminated.alive = false; io.to(room.code).emit("game:eliminated", {name:eliminated.name, role:eliminated.role}); }
-  } else io.to(room.code).emit("game:notice", "🗳️ تعادل! لم يخرج أحد.");
-  room.votes.clear();
-  const win = checkWin(room);
-  if (win) return finishGame(room, win);
-  startTimer(room, "night", room.settings.night, () => resolveNight(room));
-}
-
-io.on("connection", socket => {
-  socket.on("room:create", ({name, maxPlayers, settings}, cb) => {
-    const code = makeCode();
-    const room = { code, hostId:socket.id, started:false, phase:"lobby", players:new Map(), votes:new Map(), night:{}, settings:{...DEFAULTS, ...(settings||{})}, maxPlayers:Math.min(MAX_PLAYERS, Math.max(MIN_PLAYERS, Number(maxPlayers)||8)), timer:null, timerEndsAt:null };
-    room.players.set(socket.id, {id:socket.id, name:String(name||"لاعب").slice(0,20), alive:true});
-    rooms.set(code, room); socket.join(code); socket.data.roomCode=code;
-    cb({ok:true,code}); emitRoom(room);
-  });
-  socket.on("room:join", ({code,name}, cb) => {
-    const room = rooms.get(String(code||"").trim().toUpperCase());
-    if (!room) return cb({ok:false,error:"الغرفة غير موجودة"});
-    if (room.started) return cb({ok:false,error:"اللعبة بدأت بالفعل"});
-    if (room.players.size >= room.maxPlayers) return cb({ok:false,error:"الغرفة ممتلئة"});
-    room.players.set(socket.id,{id:socket.id,name:String(name||"لاعب").slice(0,20),alive:true});
-    socket.join(room.code); socket.data.roomCode=room.code; cb({ok:true,code:room.code}); emitRoom(room);
-  });
-  socket.on("game:start", ({code}, cb) => {
-    const room=rooms.get(code); if(!room||room.hostId!==socket.id) return cb?.({ok:false,error:"فقط الهوست يستطيع البدء"});
-    if(room.players.size<MIN_PLAYERS) return cb?.({ok:false,error:`تحتاج ${MIN_PLAYERS} لاعبين على الأقل`});
-    assignRoles(room.players.values()); room.started=true;
-    for(const p of room.players.values()) io.to(p.id).emit("game:role",{role:p.role,players:privatePlayers(room,p),roomCode:room.code});
-    io.to(room.code).emit("game:notice","🎴 تم توزيع الأدوار! استعدوا للليل.");
-    startTimer(room,"night",room.settings.night,()=>resolveNight(room));
-  });
-  socket.on("night:action", ({code,action,targetId},cb) => {
-    const room=rooms.get(code), p=room?.players.get(socket.id), target=room?.players.get(targetId);
-    if(!room||!p||!p.alive||room.phase!=="night"||!target||!target.alive) return cb?.({ok:false,error:"حركة غير صالحة"});
-    if(action==="kill" && p.role!=="mafia") return cb?.({ok:false,error:"لست مافيا"});
-    if(action==="save" && p.role!=="doctor") return cb?.({ok:false,error:"لست الطبيب"});
-    if(action==="check" && p.role!=="oldman") return cb?.({ok:false,error:"لست الشايب"});
-    if(action==="check" && p.usedOldman) return cb?.({ok:false,error:"قدرة الشايب استُخدمت"});
-    if(target.id===p.id && action!=="save") return cb?.({ok:false,error:"لا يمكنك اختيار نفسك"});
-    if(action==="kill") room.night.mafiaTarget=target.id;
-    if(action==="save") room.night.doctorTarget=target.id;
-    if(action==="check"){room.night.oldmanTarget=target.id;p.usedOldman=true;}
-    cb?.({ok:true});
-    const mafiaDone=[...room.players.values()].filter(x=>x.alive&&x.role==="mafia").every(x=>room.night.mafiaTarget);
-    const doctor=[...room.players.values()].find(x=>x.alive&&x.role==="doctor");
-    const oldman=[...room.players.values()].find(x=>x.alive&&x.role==="oldman"&&!x.usedOldman);
-    if(mafiaDone && (!doctor||room.night.doctorTarget) && (!oldman||room.night.oldmanTarget||oldman.usedOldman)) resolveNight(room);
-  });
-  socket.on("chat:send", ({code,text},cb) => {
-    const room=rooms.get(code), p=room?.players.get(socket.id); text=String(text||"").trim().slice(0,300);
-    if(!room||!p||!p.alive||room.phase!=="day"||!text) return cb?.({ok:false});
-    io.to(room.code).emit("chat:message",{id:p.id,name:p.name,text,at:Date.now()}); cb?.({ok:true});
-  });
-  socket.on("game:vote", ({code,targetId},cb) => {
-    const room=rooms.get(code), voter=room?.players.get(socket.id), target=room?.players.get(targetId);
-    if(!room||room.phase!=="vote"||!voter?.alive||!target?.alive||voter.id===target.id) return cb?.({ok:false,error:"تصويت غير صالح"});
-    room.votes.set(socket.id,target.id); io.to(room.code).emit("vote:update",{count:room.votes.size,total:alivePlayers(room).length});
-    if(room.votes.size>=alivePlayers(room).length) resolveVote(room); cb?.({ok:true});
-  });
-  socket.on("host:kick", ({code,targetId},cb) => {
-    const room=rooms.get(code); if(!room||room.hostId!==socket.id||targetId===socket.id) return cb?.({ok:false});
-    const target=room.players.get(targetId); if(!target) return cb?.({ok:false});
-    io.to(targetId).emit("room:kicked"); io.sockets.sockets.get(targetId)?.disconnect(true); room.players.delete(targetId); emitRoom(room); cb?.({ok:true});
-  });
-  socket.on("room:leave", ({code}) => socket.disconnect(true));
-  socket.on("game:rematch", ({code},cb) => {
-    const room=rooms.get(code); if(!room||room.hostId!==socket.id||room.phase!=="ended") return cb?.({ok:false});
-    room.started=false; room.phase="lobby"; room.votes.clear(); room.night={}; room.timerEndsAt=null; room.players.forEach(p=>{p.alive=true;p.role=null;p.usedOldman=false;}); emitRoom(room); cb?.({ok:true});
-  });
-  socket.on("voice:signal", ({code,to,data}) => { const room=rooms.get(code); if(room?.players.has(socket.id)&&room.players.has(to)) io.to(to).emit("voice:signal",{from:socket.id,data}); });
-  socket.on("disconnect",()=>{ const code=socket.data.roomCode,room=rooms.get(code); if(!room)return; room.players.delete(socket.id); if(room.hostId===socket.id) room.hostId=room.players.values().next().value?.id||null; if(room.players.size===0){clearTimer(room);rooms.delete(code);} else emitRoom(room); });
+const express=require("express");const http=require("http");const {Server}=require("socket.io");const crypto=require("crypto");
+const app=express(),server=http.createServer(app),io=new Server(server);app.use(express.static("public"));
+const rooms=new Map(),MIN=4,MAX=16,DEFAULT={night:35,day:90,vote:30};
+const code=()=>{let c;do c=crypto.randomBytes(3).toString("hex").toUpperCase();while(rooms.has(c));return c};
+const alive=r=>[...r.players.values()].filter(p=>p.alive),mafia=r=>alive(r).filter(p=>p.role==="mafia");
+function roles(players){let a=[...players],n=a.length>=8?2:1,r=Array(n).fill("mafia");if(a.length>=5)r.push("doctor");if(a.length>=6)r.push("oldman");while(r.length<a.length)r.push("citizen");for(let i=r.length-1;i;i--){let j=Math.floor(Math.random()*(i+1));[r[i],r[j]]=[r[j],r[i]]}a.forEach((p,i)=>{p.role=r[i];p.alive=true;p.usedOldman=false;p.nightDone=false})}
+function win(r){let a=alive(r),m=a.filter(p=>p.role==="mafia").length;return !m?"citizens":m>=a.length-m?"mafia":null}
+function pub(r){return{code:r.code,hostId:r.hostId,started:r.started,phase:r.phase,maxPlayers:r.maxPlayers,timerEndsAt:r.timerEndsAt,settings:r.settings,players:[...r.players.values()].map(p=>({id:p.id,name:p.name,alive:p.alive}))}}
+function emit(r){io.to(r.code).emit("room:update",pub(r))}function clear(r){if(r.timer)clearTimeout(r.timer);r.timer=null}
+function timer(r,phase,seconds,fn){clear(r);r.phase=phase;r.timerEndsAt=Date.now()+seconds*1000;io.to(r.code).emit("game:phase",{phase,endsAt:r.timerEndsAt});emit(r);r.timer=setTimeout(fn,seconds*1000)}
+function end(r,w){clear(r);r.phase="ended";r.timerEndsAt=null;io.to(r.code).emit("game:ended",{winner:w,players:[...r.players.values()].map(p=>({name:p.name,role:p.role,alive:p.alive}))});emit(r)}
+function resetNight(r){for(const p of r.players.values())p.nightDone=false;r.night={mafia:new Map(),save:null,check:new Map()}}
+function resolveNight(r){if(!r.started||r.phase!=="night")return;clear(r);let counts={};for(const id of r.night.mafia.values())counts[id]=(counts[id]||0)+1;let target=Object.entries(counts).sort((a,b)=>b[1]-a[1])[0]?.[0],victim=target?r.players.get(target):null,saved=r.night.save?r.players.get(r.night.save):null;if(victim?.alive&&victim.id!==saved?.id){victim.alive=false;io.to(r.code).emit("game:nightResult",{type:"death",name:victim.name})}else if(victim)io.to(r.code).emit("game:nightResult",{type:"saved"});else io.to(r.code).emit("game:nightResult",{type:"quiet"});for(const [sid,tid] of r.night.check){let p=r.players.get(sid),t=r.players.get(tid);if(p?.alive&&t)io.to(sid).emit("oldman:result",{targetName:t.name,isMafia:t.role==="mafia"})}let w=win(r);if(w)return end(r,w);resetNight(r);timer(r,"day",r.settings.day,()=>startVote(r))}
+function ready(r){let ms=mafia(r);let doctor=alive(r).find(p=>p.role==="doctor"),old=alive(r).find(p=>p.role==="oldman"&&!p.usedOldman);return ms.length>0&&ms.every(p=>r.night.mafia.has(p.id))&&(!doctor||r.night.save)&&(!old||[...r.night.check.keys()].includes(old.id))}
+function startVote(r){if(!r.started)return;r.votes.clear();timer(r,"vote",r.settings.vote,()=>resolveVote(r))}
+function resolveVote(r){if(!r.started||r.phase!=="vote")return;clear(r);let c={};for(const id of r.votes.values())c[id]=(c[id]||0)+1;let max=Math.max(0,...Object.values(c)),w=Object.entries(c).filter(([,n])=>n===max);if(w.length===1&&max){let p=r.players.get(w[0][0]);if(p?.alive){p.alive=false;io.to(r.code).emit("game:eliminated",{name:p.name,role:p.role})}}else io.to(r.code).emit("game:notice","🗳️ تعادل — لم يخرج أحد.");let x=win(r);if(x)return end(r,x);resetNight(r);timer(r,"night",r.settings.night,()=>resolveNight(r))}
+function canChat(r,p){return r.phase==="day"&&p.alive}
+io.on("connection",s=>{
+s.on("room:create",({name,maxPlayers,settings}={},cb)=>{let c=code(),r={code:c,hostId:s.id,started:false,phase:"lobby",players:new Map(),votes:new Map(),night:{},settings:{...DEFAULT,...settings},maxPlayers:Math.min(MAX,Math.max(MIN,Number(maxPlayers)||8)),timer:null,timerEndsAt:null};r.players.set(s.id,{id:s.id,name:String(name||"لاعب").slice(0,20),alive:true});rooms.set(c,r);s.join(c);s.data.room=c;cb?.({ok:true,code:c});emit(r)});
+s.on("room:join",({code:c,name}={},cb)=>{let r=rooms.get(String(c||"").toUpperCase());if(!r)return cb?.({ok:false,error:"الغرفة غير موجودة"});if(r.started)return cb?.({ok:false,error:"اللعبة بدأت"});if(r.players.size>=r.maxPlayers)return cb?.({ok:false,error:"الغرفة ممتلئة"});r.players.set(s.id,{id:s.id,name:String(name||"لاعب").slice(0,20),alive:true});s.join(r.code);s.data.room=r.code;cb?.({ok:true,code:r.code});emit(r)});
+s.on("game:start",({code:c}={},cb)=>{let r=rooms.get(c);if(!r||r.hostId!==s.id)return cb?.({ok:false,error:"فقط الهوست يستطيع البدء"});if(r.players.size<MIN)return cb?.({ok:false,error:`تحتاج ${MIN} لاعبين على الأقل`});roles(r.players.values());r.started=true;for(let p of r.players.values())io.to(p.id).emit("game:role",{role:p.role});resetNight(r);io.to(r.code).emit("game:notice","🎴 تم توزيع الأدوار — تبدأ الليلة الآن.");timer(r,"night",r.settings.night,()=>resolveNight(r));});
+s.on("night:action",({code:c,action,targetId}={},cb)=>{let r=rooms.get(c),p=r?.players.get(s.id),t=r?.players.get(targetId);if(!r||r.phase!=="night"||!p?.alive||!t?.alive)return cb?.({ok:false,error:"حركة غير صالحة"});if(t.id===p.id&&action!=="save")return cb?.({ok:false,error:"لا يمكنك اختيار نفسك"});if(action==="kill"&&p.role!=="mafia")return cb?.({ok:false,error:"لست مافيا"});if(action==="save"&&p.role!=="doctor")return cb?.({ok:false,error:"لست الطبيب"});if(action==="check"&&(p.role!=="oldman"||p.usedOldman))return cb?.({ok:false,error:"قدرة غير متاحة"});if(action==="kill")r.night.mafia.set(p.id,t.id);if(action==="save")r.night.save=t.id;if(action==="check"){r.night.check.set(p.id,t.id);p.usedOldman=true}p.nightDone=true;cb?.({ok:true});if(ready(r))resolveNight(r)});
+s.on("chat:send",({code:c,text,channel="public"}={},cb)=>{let r=rooms.get(c),p=r?.players.get(s.id),msg=String(text||"").trim().slice(0,300);if(!r||!p||!msg||!canChat(r,p))return cb?.({ok:false});if(channel==="mafia"&&p.role!=="mafia")return cb?.({ok:false});let targets=channel==="mafia"?mafia(r).map(x=>x.id):alive(r).map(x=>x.id);for(const id of targets)io.to(id).emit("chat:message",{name:p.name,text:msg,channel,at:Date.now()});cb?.({ok:true})});
+s.on("game:vote",({code:c,targetId}={},cb)=>{let r=rooms.get(c),p=r?.players.get(s.id),t=r?.players.get(targetId);if(!r||r.phase!=="vote"||!p?.alive||!t?.alive||p.id===t.id)return cb?.({ok:false,error:"تصويت غير صالح"});r.votes.set(s.id,t.id);io.to(r.code).emit("vote:update",{count:r.votes.size,total:alive(r).length});if(r.votes.size===alive(r).length)resolveVote(r);cb?.({ok:true})});
+s.on("host:kick",({code:c,targetId}={},cb)=>{let r=rooms.get(c);if(!r||r.hostId!==s.id||targetId===s.id)return cb?.({ok:false});if(!r.players.has(targetId))return cb?.({ok:false});io.to(targetId).emit("room:kicked");io.sockets.sockets.get(targetId)?.disconnect(true);r.players.delete(targetId);emit(r);cb?.({ok:true})});
+s.on("game:rematch",({code:c}={},cb)=>{let r=rooms.get(c);if(!r||r.hostId!==s.id||r.phase!=="ended")return cb?.({ok:false});r.started=false;r.phase="lobby";r.votes.clear();r.timerEndsAt=null;for(let p of r.players.values()){p.alive=true;p.role=null;p.usedOldman=false}emit(r);cb?.({ok:true})});
+s.on("voice:signal",({code:c,to,data}={})=>{let r=rooms.get(c);if(r?.players.has(s.id)&&r.players.has(to))io.to(to).emit("voice:signal",{from:s.id,data})});
+s.on("room:leave",()=>s.disconnect(true));s.on("disconnect",()=>{let r=rooms.get(s.data.room);if(!r)return;r.players.delete(s.id);if(r.hostId===s.id)r.hostId=r.players.values().next().value?.id||null;if(!r.players.size){clear(r);rooms.delete(r.code)}else{if(r.started&&r.phase!=="ended"){let w=win(r);if(w)end(r,w)}emit(r)}})
 });
-
-const PORT=process.env.PORT||3000; server.listen(PORT,()=>console.log(`Mafia server running on http://localhost:${PORT}`));
+const PORT=process.env.PORT||3000;server.listen(PORT,()=>console.log(`Mafia server on ${PORT}`));
