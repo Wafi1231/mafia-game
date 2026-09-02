@@ -1,0 +1,60 @@
+
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MAFIA — لعبة المافيا</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="bg"></div>
+<main>
+  <header>
+    <div class="logo">MAFIA<span>•</span></div>
+    <div class="sub">لعبة اجتماعية — غرفة خاصة • حتى 16 لاعب</div>
+  </header>
+
+  <section id="home" class="panel">
+    <h1>من هو المافيا؟</h1>
+    <p class="muted">أنشئ غرفة وشارك الكود مع أصحابك، أو ادخل غرفة موجودة.</p>
+    <input id="name" maxlength="20" placeholder="اسمك">
+    <div class="row">
+      <button id="create">إنشاء غرفة</button>
+      <div class="joinbox">
+        <input id="code" maxlength="6" placeholder="كود الغرفة">
+        <button id="join">دخول</button>
+      </div>
+    </div>
+    <div id="error" class="error"></div>
+  </section>
+
+  <section id="lobby" class="panel hidden">
+    <div class="roomhead">
+      <div><small>كود الغرفة</small><strong id="roomCode"></strong></div>
+      <button class="secondary" id="copy">نسخ الكود</button>
+    </div>
+    <h2>اللاعبون <span id="count"></span></h2>
+    <div id="players" class="players"></div>
+    <div id="hostControls"></div>
+    <p class="hint">الهوست يبدأ اللعبة، وبعدها كل لاعب يشوف بطاقته السرية على جهازه فقط.</p>
+  </section>
+
+  <section id="game" class="panel hidden">
+    <div class="phase"><span id="phaseDot"></span><span id="phaseText">الليل</span></div>
+    <div id="roleCard" class="rolecard">
+      <div class="roleIcon">?</div>
+      <div class="roleTitle">بطاقتك السرية</div>
+      <div id="roleName">بانتظار بدء اللعبة...</div>
+      <div id="roleDesc" class="muted"></div>
+    </div>
+    <h2>اللاعبون</h2>
+    <div id="gamePlayers" class="players"></div>
+    <div id="gameControls"></div>
+    <div id="notice" class="notice"></div>
+  </section>
+</main>
+<script src="/socket.io/socket.io.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
