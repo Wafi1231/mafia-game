@@ -1,59 +1,24 @@
-
 const socket=io();
-let me={name:"",code:"",host:false,role:null};
-const $=id=>document.getElementById(id);
-const show=(id,on=true)=>$(id).classList.toggle("hidden",!on);
-function err(x){$("error").textContent=x||""}
-function roleInfo(role){
- const m={mafia:["المافيا","أنت من المافيا. اعملوا سراً على إخراج المواطنين.","☠️"],
- oldman:["الشايب","أنت الشايب. دورك خاص، وحاول مساعدة فريق المواطنين دون كشف نفسك.","🧓"],
- doctor:["الطبيب","أنت الطبيب. هدفك مساعدة المواطنين وحماية الفريق.","🩺"],
- citizen:["مواطن","أنت مواطن. اكتشف المافيا بالتحليل والتصويت.","👤"]};
- return m[role]||["غير معروف","", "?"];
-}
-function enterLobby(){
- show("home",false);show("lobby",true);show("game",false);
- $("roomCode").textContent=me.code;
-}
-$("create").onclick=()=>{
- me.name=$("name").value.trim()||"لاعب";
- socket.emit("room:create",{name:me.name},r=>{if(!r.ok)return err(r.error);me.code=r.code;me.host=true;enterLobby();});
-};
-$("join").onclick=()=>{
- me.name=$("name").value.trim()||"لاعب";
- const code=$("code").value.trim().toUpperCase();
- socket.emit("room:join",{name:me.name,code},r=>{if(!r.ok)return err(r.error);me.code=r.code;enterLobby();});
-};
-$("copy").onclick=()=>navigator.clipboard?.writeText(me.code);
-socket.on("room:update",room=>{
- me.host=room.hostId===socket.id;
- if(!room.started){
-  show("home",false);show("lobby",true);show("game",false);
-  $("roomCode").textContent=room.code;$("count").textContent=`(${room.players.length}/16)`;
-  $("players").innerHTML=room.players.map(p=>`<div class="player"><span>${escapeHtml(p.name)}</span>${p.id===room.hostId?'<span class="badge">HOST</span>':''}</div>`).join("");
-  $("hostControls").innerHTML=me.host?`<div class="host"><button id="start">ابدأ اللعبة</button></div>`:"";
-  if(me.host)$("start").onclick=()=>socket.emit("game:start",{code:me.code},r=>{if(r&&!r.ok)err(r.error)});
- }else renderPlayers(room.players,room.phase);
-});
-socket.on("game:role",d=>{
- me.role=d.role;show("home",false);show("lobby",false);show("game",true);
- const [name,desc,icon]=roleInfo(d.role);$("roleName").textContent=name;$("roleDesc").textContent=desc;$("roleCard").querySelector(".roleIcon").textContent=icon;
-});
-socket.on("game:phase",p=>{ $("phaseText").textContent=p==="night"?"الليل":"النهار"; renderPhaseControls(p); });
-socket.on("game:notice",x=>$("notice").textContent=x);
-socket.on("game:ended",winner=>{
- $("gameControls").innerHTML=`<div class="end">${winner==="mafia"?"☠️ المافيا فازت!":"🎉 المواطنون فازوا!"}</div>`;
-});
-function renderPlayers(players,phase){
- $("gamePlayers").innerHTML=players.map(p=>{
-  const disabled=!p.alive||p.id===socket.id||phase!=="day";
-  return `<div class="player ${p.alive?"":"dead"}"><span>${escapeHtml(p.name)}</span><button class="vote" ${disabled?"disabled":""} data-id="${p.id}">تصويت</button></div>`;
- }).join("");
- document.querySelectorAll(".vote").forEach(b=>b.onclick=()=>socket.emit("game:vote",{code:me.code,targetId:b.dataset.id}));
-}
-function renderPhaseControls(phase){
- if(!me.host)return $("gameControls").innerHTML="";
- $("gameControls").innerHTML=phase==="night"?`<button class="secondary" id="day">بدء النهار والتصويت</button>`:`<button class="secondary" id="night">بدء الليل</button>`;
- $(phase==="night"?"day":"night").onclick=()=>socket.emit("game:phase",{code:me.code,phase:phase==="night"?"day":"night"});
-}
-function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]))}
+let me={name:"",code:"",host:false,role:null}; let room=null;
+const $=id=>document.getElementById(id); const show=(id,on=true)=>$(id).classList.toggle("hidden",!on);
+function err(x){$("error").textContent=x||""} function escapeHtml(s){return String(s).replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'\"':"&quot;","'":"&#039;"}[c]))}
+function roleInfo(r){return ({mafia:["المافيا","اختر ضحية سراً في الليل.","☠️"],doctor:["الطبيب","اختر شخصاً لإنقاذه في الليل.","🩺"],oldman:["الشايب","افحص لاعباً مرة واحدة لمعرفة هل هو مافيا.","🧓"],citizen:["مواطن","ناقش وحلل وصوّت لإخراج المافيا.","👤"]})[r]||["؟","","❔"]}
+function enterLobby(){show("home",false);show("lobby",true);show("game",false);$("roomCode").textContent=me.code}
+$("create").onclick=()=>{me.name=$("name").value.trim()||"لاعب";socket.emit("room:create",{name:me.name,maxPlayers:+$("maxPlayers").value||8},r=>{if(!r.ok)return err(r.error);me.code=r.code;enterLobby()})};
+$("join").onclick=()=>{me.name=$("name").value.trim()||"لاعب";socket.emit("room:join",{name:me.name,code:$("code").value},r=>{if(!r.ok)return err(r.error);me.code=r.code;enterLobby()})};
+$("copy").onclick=()=>navigator.clipboard?.writeText(me.code); $("leave").onclick=()=>socket.emit("room:leave",{code:me.code});
+$("sendChat").onclick=sendChat; $("chatInput").onkeydown=e=>{if(e.key==="Enter")sendChat()}; function sendChat(){let t=$("chatInput").value.trim();if(t)socket.emit("chat:send",{code:me.code,text:t},r=>{if(r?.ok)$("chatInput").value=""})}
+$("rematch").onclick=()=>socket.emit("game:rematch",{code:me.code});
+function renderLobby(){show("home",false);show("lobby",true);show("game",false);$("roomCode").textContent=room.code;$("count").textContent=`(${room.players.length}/${room.maxPlayers})`;$("players").innerHTML=room.players.map(p=>`<div class="player"><span>${escapeHtml(p.name)}</span><span>${p.id===room.hostId?'👑 HOST':''}</span>${me.host&&p.id!==socket.id?`<button class="kick" data-id="${p.id}">Kick</button>`:""}</div>`).join("");document.querySelectorAll('.kick').forEach(b=>b.onclick=()=>socket.emit('host:kick',{code:me.code,targetId:b.dataset.id));$("hostControls").innerHTML=me.host?`<button id="start">🎴 توزيع الأدوار وابدأ</button>`:"<p class='hint'>بانتظار الهوست...</p>";if(me.host)$("start").onclick=()=>socket.emit("game:start",{code:me.code},r=>r&&!r.ok&&err(r.error))}
+socket.on("room:update",r=>{room=r;me.host=r.hostId===socket.id;if(!r.started)renderLobby();else renderPlayers(r.players,r.phase)});
+socket.on("game:role",d=>{me.role=d.role;show("home",false);show("lobby",false);show("game",true);let [n,desc,icon]=roleInfo(d.role);$("roleIcon").textContent=icon;$("roleName").textContent=n;$("roleDesc").textContent=desc;$("result").textContent="";});
+socket.on("game:phase",d=>{let p=typeof d==='string'?d:d.phase;$("phaseText").textContent=p==='night'?'🌙 الليل':p==='day'?'☀️ النهار':'🗳️ التصويت';$("phaseTimer").dataset.ends=d.endsAt||0;renderPhaseControls(p);renderPlayers(room?.players||[],p);});
+socket.on("game:notice",x=>$("notice").textContent=x); socket.on("game:eliminated",d=>$("notice").textContent=`☠️ خرج ${d.name} من اللعبة.`);
+socket.on("vote:update",d=>$("voteStatus").textContent=`تم التصويت: ${d.count}/${d.total}`);
+socket.on("game:ended",d=>{$("result").textContent=d.winner==='mafia'?'☠️ المافيا فازت!':'🏆 المواطنون فازوا!';show('rematch',me.host);});
+socket.on("oldman:result",d=>$("notice").textContent=d.isMafia?`🧓 نتيجة الشايب: ${d.targetName} مافيا!`:`🧓 نتيجة الشايب: ${d.targetName} ليس مافيا.`);
+socket.on("room:kicked",()=>{location.reload()});
+socket.on("chat:message",m=>{let e=document.createElement('div');e.className='msg';e.innerHTML=`<b>${escapeHtml(m.name)}</b> ${escapeHtml(m.text)}`;$("chatMessages").appendChild(e);$("chatMessages").scrollTop=$("chatMessages").scrollHeight});
+function renderPlayers(players,phase){$("gamePlayers").innerHTML=players.map(p=>{let action='';if(p.alive&&p.id!==socket.id&&phase==='night'){if(me.role==='mafia')action=`<button class="action" data-a="kill" data-id="${p.id}">☠️ قتل</button>`;else if(me.role==='doctor')action=`<button class="action" data-a="save" data-id="${p.id}">🩺 إنقاذ</button>`;else if(me.role==='oldman')action=`<button class="action" data-a="check" data-id="${p.id}">👁️ فحص</button>`}if(p.alive&&p.id!==socket.id&&phase==='vote')action=`<button class="vote" data-id="${p.id}">🗳️ تصويت</button>`;return `<div class="player ${p.alive?'':'dead'}"><span>${escapeHtml(p.name)}${p.alive?'':' ☠️'}</span>${action}</div>`}).join('');document.querySelectorAll('.action').forEach(b=>b.onclick=()=>socket.emit('night:action',{code:me.code,action:b.dataset.a,targetId:b.dataset.id},r=>{if(!r.ok)$("notice").textContent=r.error}));document.querySelectorAll('.vote').forEach(b=>b.onclick=()=>socket.emit('game:vote',{code:me.code,targetId:b.dataset.id},r=>{if(!r.ok)$("notice").textContent=r.error}));}
+function renderPhaseControls(p){$("hostPhase").innerHTML=me.host&&p==='day'?'<small>المؤقت ينتقل للتصويت تلقائياً.</small>':''}
+setInterval(()=>{let end=+$("phaseTimer").dataset.ends||0;let n=Math.max(0,Math.ceil((end-Date.now())/1000));$("phaseTimer").textContent=end?`${n}s`:''},250);
